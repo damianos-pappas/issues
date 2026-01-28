@@ -1,8 +1,6 @@
 name: Project audit fields update
 
 on:
-  schedule:
-    - cron: "*/30 * * * *" # UTC
   workflow_dispatch: {}
 
 permissions:
