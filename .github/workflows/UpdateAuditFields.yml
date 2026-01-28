@@ -1,0 +1,250 @@
+ame: Project audit (CreatedAt/UpdatedAt/UpdatedProperty)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # cron is UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: project-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update project fields + snapshot
+        uses: actions/github-script@v7
+        env:
+          PROJECT_ID: ${{ secrets.PROJECT_ID }}
+          FIELD_CREATEDAT_ID: ${{ secrets.FIELD_CREATEDAT_ID }}
+          FIELD_UPDATEDAT_ID: ${{ secrets.FIELD_UPDATEDAT_ID }}
+          FIELD_UPDATEDPROPERTY_ID: ${{ secrets.FIELD_UPDATEDPROPERTY_ID }}
+          SNAPSHOT_PATH: .github/project-snapshots/user-project.json
+        with:
+          github-token: ${{ secrets.PROJECT_PAT }}
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+
+            const projectId = process.env.PROJECT_ID;
+            const fieldCreatedAtId = process.env.FIELD_CREATEDAT_ID;
+            const fieldUpdatedAtId = process.env.FIELD_UPDATEDAT_ID;
+            const fieldUpdatedPropertyId = process.env.FIELD_UPDATEDPROPERTY_ID;
+            const snapshotPath = process.env.SNAPSHOT_PATH;
+
+            if (!projectId || !fieldCreatedAtId || !fieldUpdatedAtId || !fieldUpdatedPropertyId) {
+              throw new Error("Missing PROJECT_ID / FIELD_CREATEDAT_ID / FIELD_UPDATEDAT_ID / FIELD_UPDATEDPROPERTY_ID");
+            }
+
+            const utcToday = () => {
+              const d = new Date();
+              const yyyy = d.getUTCFullYear();
+              const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+              const dd = String(d.getUTCDate()).padStart(2, "0");
+              return `${yyyy}-${mm}-${dd}`; // date field format
+            };
+
+            const startOfTodayUtc = () => {
+              const now = new Date();
+              return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+            };
+
+            function safeReadJson(p) {
+              try {
+                return JSON.parse(fs.readFileSync(p, "utf8"));
+              } catch {
+                return {};
+              }
+            }
+
+            function ensureDir(p) {
+              fs.mkdirSync(path.dirname(p), { recursive: true });
+            }
+
+            // --- GraphQL helpers ---
+            async function fetchItemsPage(after) {
+              return await github.graphql(
+                `
+                query($projectId: ID!, $after: String) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      items(first: 100, after: $after) {
+                        nodes {
+                          id
+                          updatedAt
+                          fieldValues(first: 100) {
+                            nodes {
+                              __typename
+                              ... on ProjectV2ItemFieldTextValue {
+                                text
+                                field { ... on ProjectV2FieldCommon { id name } }
+                              }
+                              ... on ProjectV2ItemFieldDateValue {
+                                date
+                                field { ... on ProjectV2FieldCommon { id name } }
+                              }
+                              ... on ProjectV2ItemFieldNumberValue {
+                                number
+                                field { ... on ProjectV2FieldCommon { id name } }
+                              }
+                              ... on ProjectV2ItemFieldSingleSelectValue {
+                                name
+                                field { ... on ProjectV2FieldCommon { id name } }
+                              }
+                              ... on ProjectV2ItemFieldIterationValue {
+                                title
+                                field { ... on ProjectV2FieldCommon { id name } }
+                              }
+                            }
+                          }
+                        }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    }
+                  }
+                }
+                `,
+                { projectId, after }
+              );
+            }
+
+            async function setDateField(itemId, fieldId, date) {
+              await github.graphql(
+                `
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $date: Date!) {
+                  updateProjectV2ItemFieldValue(input:{
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { date: $date }
+                  }) { projectV2Item { id } }
+                }
+                `,
+                { projectId, itemId, fieldId, date }
+              );
+            }
+
+            async function setTextField(itemId, fieldId, text) {
+              await github.graphql(
+                `
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+                  updateProjectV2ItemFieldValue(input:{
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { text: $text }
+                  }) { projectV2Item { id } }
+                }
+                `,
+                { projectId, itemId, fieldId, text }
+              );
+            }
+
+            // --- Normalize current field values into a comparable snapshot ---
+            function normalizeFieldValue(node) {
+              const t = node.__typename;
+              if (t === "ProjectV2ItemFieldTextValue") return node.text ?? "";
+              if (t === "ProjectV2ItemFieldDateValue") return node.date ?? "";
+              if (t === "ProjectV2ItemFieldNumberValue") return node.number ?? "";
+              if (t === "ProjectV2ItemFieldSingleSelectValue") return node.name ?? "";
+              if (t === "ProjectV2ItemFieldIterationValue") return node.title ?? "";
+              return null; // ignore unsupported / empty types
+            }
+
+            function buildItemSnapshot(item) {
+              const snap = {};
+              for (const fv of item.fieldValues.nodes || []) {
+                const field = fv.field;
+                if (!field?.id || !field?.name) continue;
+                const v = normalizeFieldValue(fv);
+                if (v === null) continue;
+                snap[field.id] = { name: field.name, value: String(v) };
+              }
+              return snap;
+            }
+
+            // Load previous snapshot
+            const prev = safeReadJson(snapshotPath); // { [itemId]: { [fieldId]: {name,value} } }
+            const next = {};
+
+            const today = utcToday();
+            const todayStart = startOfTodayUtc();
+
+            let after = null;
+            let processed = 0;
+            let updatedCount = 0;
+
+            while (true) {
+              const data = await fetchItemsPage(after);
+              const conn = data.node.items;
+              const items = conn.nodes || [];
+
+              for (const item of items) {
+                processed++;
+
+                const currentSnap = buildItemSnapshot(item);
+                next[item.id] = currentSnap;
+
+                // Only touch items updated today (UTC)
+                const itemUpdatedAt = new Date(item.updatedAt);
+                if (itemUpdatedAt < todayStart) continue;
+
+                const prevSnap = prev[item.id] || {};
+                const changedFieldNames = [];
+
+                // Diff: consider any field id present now OR before
+                const fieldIds = new Set([...Object.keys(prevSnap), ...Object.keys(currentSnap)]);
+                for (const fid of fieldIds) {
+                  const a = prevSnap[fid]?.value ?? "";
+                  const b = currentSnap[fid]?.value ?? "";
+                  if (a !== b) {
+                    // Name from current if available, else previous
+                    const nm = currentSnap[fid]?.name ?? prevSnap[fid]?.name ?? fid;
+                    // Don't report our own audit fields as "changed properties"
+                    if ([fieldCreatedAtId, fieldUpdatedAtId, fieldUpdatedPropertyId].includes(fid)) continue;
+                    changedFieldNames.push(nm);
+                  }
+                }
+
+                // Determine if CreatedAt is empty (from current snapshot)
+                const createdVal = currentSnap[fieldCreatedAtId]?.value ?? "";
+                if (!createdVal) {
+                  await setDateField(item.id, fieldCreatedAtId, today);
+                }
+
+                // Always set UpdatedAt for items updated today
+                await setDateField(item.id, fieldUpdatedAtId, today);
+
+                // UpdatedProperty = what changed since last run (or fallback)
+                const updatedProp = changedFieldNames.length ? changedFieldNames.join(", ") : "unknown";
+                await setTextField(item.id, fieldUpdatedPropertyId, updatedProp);
+
+                updatedCount++;
+              }
+
+              if (!conn.pageInfo.hasNextPage) break;
+              after = conn.pageInfo.endCursor;
+            }
+
+            ensureDir(snapshotPath);
+            fs.writeFileSync(snapshotPath, JSON.stringify(next, null, 2), "utf8");
+
+            core.info(`Scanned ${processed} items. Updated ${updatedCount} items (updated since ${today} UTC). Snapshot saved to ${snapshotPath}.`);
+
+      - name: Commit snapshot changes
+        run: |
+          if git status --porcelain | grep -q .; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .github/project-snapshots/user-project.json
+            git commit -m "chore: update project snapshot"
+            git push
+          else
+            echo "No snapshot changes to commit."
+          fi
