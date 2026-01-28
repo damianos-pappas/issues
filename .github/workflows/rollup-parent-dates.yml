@@ -1,0 +1,350 @@
+name: Roll up parent Start/End from sub-issues
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rollup-parent-dates
+  cancel-in-progress: false
+
+env:
+  PROJECT_OWNER: damianos-pappas
+  PROJECT_NUMBER: 1
+  FIELD_START_DATE_NAME: "Start Date"
+  FIELD_END_DATE_NAME: "End Date"
+
+jobs:
+  resolve-project-id:
+    runs-on: ubuntu-latest
+    outputs:
+      project_id: ${{ steps.get_project_id.outputs.project-id }}
+    steps:
+      - name: Get Project ID
+        id: get_project_id
+        uses: monry/actions-get-project-id@v2
+        with:
+          github-token: ${{ secrets.PROJECT_PAT }}
+          project-owner: ${{ env.PROJECT_OWNER }}
+          project-number: ${{ env.PROJECT_NUMBER }}
+
+      - name: Show Project ID
+        run: |
+          echo "PROJECT_ID = ${{ steps.get_project_id.outputs.project-id }}"
+          echo "ERROR (if any) = ${{ steps.get_project_id.outputs.error }}"
+
+  resolve-field-ids:
+    runs-on: ubuntu-latest
+    needs: [resolve-project-id]
+    outputs:
+      field_start_id: ${{ steps.resolve.outputs.field_start_id }}
+      field_end_id: ${{ steps.resolve.outputs.field_end_id }}
+    steps:
+      - name: Resolve Start/End field IDs
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_PAT }}
+          script: |
+            const owner = process.env.PROJECT_OWNER;
+            const projectNumber = Number(process.env.PROJECT_NUMBER);
+            const startName = process.env.FIELD_START_DATE_NAME;
+            const endName = process.env.FIELD_END_DATE_NAME;
+
+            const data = await github.graphql(
+              `
+              query($login: String!, $number: Int!) {
+                user(login: $login) {
+                  projectV2(number: $number) {
+                    id
+                    title
+                    fields(first: 100) {
+                      nodes {
+                        __typename
+                        ... on ProjectV2FieldCommon {
+                          id
+                          name
+                          dataType
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              `,
+              { login: owner, number: projectNumber }
+            );
+
+            const fields = data.user.projectV2.fields.nodes || [];
+
+            function findDateFieldId(name) {
+              const f = fields.find(x => x?.name === name);
+              if (!f) throw new Error(`Field not found: "${name}"`);
+              if (f.dataType !== "DATE") throw new Error(`Field "${name}" is ${f.dataType}, expected DATE`);
+              return f.id;
+            }
+
+            const startId = findDateFieldId(startName);
+            const endId = findDateFieldId(endName);
+
+            core.setOutput("field_start_id", startId);
+            core.setOutput("field_end_id", endId);
+
+            console.log(`Project: ${data.user.projectV2.title}`);
+            console.log(`${startName}: ${startId}`);
+            console.log(`${endName}: ${endId}`);
+
+  rollup:
+    runs-on: ubuntu-latest
+    needs: [resolve-project-id, resolve-field-ids]
+    steps:
+      - name: Roll up parent dates
+        uses: actions/github-script@v7
+        env:
+          PROJECT_ID: ${{ needs.resolve-project-id.outputs.project_id }}
+          FIELD_START_ID: ${{ needs.resolve-field-ids.outputs.field_start_id }}
+          FIELD_END_ID: ${{ needs.resolve-field-ids.outputs.field_end_id }}
+        with:
+          github-token: ${{ secrets.PROJECT_PAT }}
+          script: |
+            const projectId = process.env.PROJECT_ID;
+            const fieldStartId = process.env.FIELD_START_ID;
+            const fieldEndId = process.env.FIELD_END_ID;
+
+            if (!projectId || !fieldStartId || !fieldEndId) {
+              throw new Error("Missing PROJECT_ID / FIELD_START_ID / FIELD_END_ID");
+            }
+
+            // --- time window: last 24h (UTC) ---
+            const now = new Date();
+            const since = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+            // --- helpers ---
+            const parseYmd = (s) => (s ? new Date(`${s}T00:00:00Z`) : null); // treat DATE fields as UTC midnight
+            const ymd = (d) => {
+              const yyyy = d.getUTCFullYear();
+              const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+              const dd = String(d.getUTCDate()).padStart(2, "0");
+              return `${yyyy}-${mm}-${dd}`;
+            };
+
+            async function setDateField(itemId, fieldId, dateStr) {
+              await github.graphql(
+                `
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $date: Date!) {
+                  updateProjectV2ItemFieldValue(input:{
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { date: $date }
+                  }) { projectV2Item { id } }
+                }
+                `,
+                { projectId, itemId, fieldId, date: dateStr }
+              );
+            }
+
+            async function fetchItemsPage(after) {
+              return await github.graphql(
+                `
+                query($projectId: ID!, $after: String) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      items(first: 100, after: $after) {
+                        nodes {
+                          id
+                          updatedAt
+                          content {
+                            __typename
+                            ... on Issue {
+                              id
+                              number
+                              repository { nameWithOwner }
+                            }
+                          }
+                          fieldValues(first: 50) {
+                            nodes {
+                              __typename
+                              ... on ProjectV2ItemFieldDateValue {
+                                date
+                                field { ... on ProjectV2FieldCommon { id name } }
+                              }
+                            }
+                          }
+                        }
+                        pageInfo { hasNextPage endCursor }
+                      }
+                    }
+                  }
+                }
+                `,
+                { projectId, after }
+              );
+            }
+
+            function getDateValue(item, wantedFieldId) {
+              const nodes = item.fieldValues?.nodes || [];
+              const n = nodes.find(v => v?.field?.id === wantedFieldId);
+              return n?.date || "";
+            }
+
+            // Build a lookup of issues-in-project:
+            // issueNodeId -> { itemId, repoFullName, number, start, end, updatedAt }
+            const issueIndex = new Map();
+
+            // Track which child issues changed in last 24h
+            const changedChildren = [];
+
+            let after = null;
+            let scanned = 0;
+
+            while (true) {
+              const data = await fetchItemsPage(after);
+              const conn = data.node.items;
+              const items = conn.nodes || [];
+
+              for (const item of items) {
+                scanned++;
+
+                if (item.content?.__typename !== "Issue") continue;
+                const issueId = item.content.id;
+
+                const start = getDateValue(item, fieldStartId);
+                const end = getDateValue(item, fieldEndId);
+
+                issueIndex.set(issueId, {
+                  projectItemId: item.id,
+                  repoFullName: item.content.repository.nameWithOwner,
+                  number: item.content.number,
+                  start,
+                  end,
+                  updatedAt: item.updatedAt,
+                });
+
+                const itemUpdatedAt = new Date(item.updatedAt);
+                if (itemUpdatedAt >= since) {
+                  changedChildren.push(issueId);
+                }
+              }
+
+              if (!conn.pageInfo.hasNextPage) break;
+              after = conn.pageInfo.endCursor;
+            }
+
+            core.info(`Scanned ${scanned} project items; found ${changedChildren.length} changed issues in last 24h.`);
+
+            // Deduplicate changed children
+            const uniqueChangedChildren = [...new Set(changedChildren)];
+
+            // For each changed child, find its parent via REST:
+            // GET /repos/{owner}/{repo}/issues/{issue_number}/parent
+            // Then for each parent, list its sub-issues:
+            // GET /repos/{owner}/{repo}/issues/{issue_number}/sub_issues
+            // (docs: REST sub-issues endpoints) :contentReference[oaicite:1]{index=1}
+
+            // Map parentIssueNodeId -> { repoFullName, number }
+            const parentsToRecalc = new Map();
+
+            async function getParentIssue(repoFullName, issueNumber) {
+              const [owner, repo] = repoFullName.split("/");
+              try {
+                const res = await github.request("GET /repos/{owner}/{repo}/issues/{issue_number}/parent", {
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                  headers: { "X-GitHub-Api-Version": "2022-11-28" },
+                });
+                // response is an Issue JSON object (REST) which includes node_id + number
+                return res.data; // may throw 404 if no parent
+              } catch (e) {
+                // If no parent, GitHub returns 404 for this endpoint; just skip.
+                if (e.status === 404) return null;
+                throw e;
+              }
+            }
+
+            async function listSubIssues(repoFullName, parentNumber) {
+              const [owner, repo] = repoFullName.split("/");
+              const all = [];
+              let page = 1;
+
+              while (true) {
+                const res = await github.request("GET /repos/{owner}/{repo}/issues/{issue_number}/sub_issues", {
+                  owner,
+                  repo,
+                  issue_number: parentNumber,
+                  per_page: 100,
+                  page,
+                  headers: { "X-GitHub-Api-Version": "2022-11-28" },
+                });
+
+                const items = res.data || [];
+                all.push(...items);
+
+                if (items.length < 100) break;
+                page++;
+              }
+
+              return all;
+            }
+
+            for (const childIssueId of uniqueChangedChildren) {
+              const child = issueIndex.get(childIssueId);
+              if (!child) continue;
+
+              const parent = await getParentIssue(child.repoFullName, child.number);
+              if (!parent) continue;
+
+              // parent.node_id is REST node id for issue -> matches GraphQL node id format
+              parentsToRecalc.set(parent.node_id, {
+                repoFullName: child.repoFullName,
+                number: parent.number,
+              });
+            }
+
+            core.info(`Need to recalc ${parentsToRecalc.size} parents.`);
+
+            let parentsUpdated = 0;
+
+            for (const [parentNodeId, parentRef] of parentsToRecalc.entries()) {
+              const parentInProject = issueIndex.get(parentNodeId);
+              if (!parentInProject) {
+                core.info(`Parent issue ${parentRef.repoFullName}#${parentRef.number} is not in this project; skipping update.`);
+                continue;
+              }
+
+              const subIssues = await listSubIssues(parentRef.repoFullName, parentRef.number);
+
+              // Only consider children that are in the project (so we can read Start/End fields)
+              const childDates = [];
+              for (const si of subIssues) {
+                const childNodeId = si.node_id;
+                const childInProject = issueIndex.get(childNodeId);
+                if (!childInProject) continue;
+
+                if (childInProject.start) childDates.push({ kind: "start", d: parseYmd(childInProject.start) });
+                if (childInProject.end) childDates.push({ kind: "end", d: parseYmd(childInProject.end) });
+              }
+
+              const starts = childDates.filter(x => x.kind === "start").map(x => x.d).filter(Boolean);
+              const ends = childDates.filter(x => x.kind === "end").map(x => x.d).filter(Boolean);
+
+              if (!starts.length && !ends.length) {
+                core.info(`No child Start/End dates found in project for parent ${parentRef.repoFullName}#${parentRef.number}; skipping.`);
+                continue;
+              }
+
+              const minStart = starts.length ? new Date(Math.min(...starts.map(d => d.getTime()))) : null;
+              const maxEnd = ends.length ? new Date(Math.max(...ends.map(d => d.getTime()))) : null;
+
+              // Update parent fields
+              if (minStart) await setDateField(parentInProject.projectItemId, fieldStartId, ymd(minStart));
+              if (maxEnd) await setDateField(parentInProject.projectItemId, fieldEndId, ymd(maxEnd));
+
+              parentsUpdated++;
+              core.info(`Updated parent ${parentRef.repoFullName}#${parentRef.number}: Start=${minStart ? ymd(minStart) : "(unchanged)"} End=${maxEnd ? ymd(maxEnd) : "(unchanged)"}`);
+            }
+
+            core.info(`Done. Updated ${parentsUpdated} parent items.`);
