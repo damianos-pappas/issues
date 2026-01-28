@@ -1,0 +1,28 @@
+name: Get user Project v2 ID
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  get-project-id:
+    runs-on: ubuntu-latest
+
+    outputs:
+      project_id: ${{ steps.project.outputs.project_id }}
+
+    steps:
+      - name: Get Project ID
+        id: project
+        uses: monry/actions-get-project-id@v2
+        with:
+          github-token: ${{ secrets.PROJECT_PAT }}
+          project-owner: damianos-pappas
+          project-number: 1
+          project-type: user
+
+      - name: Show Project ID
+        run: |
+          echo "PROJECT_ID = ${{ steps.project.outputs.project_id }}"
