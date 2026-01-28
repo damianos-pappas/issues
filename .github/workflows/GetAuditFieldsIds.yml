@@ -1,0 +1,95 @@
+name: Get Project v2 Field IDs (user)
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  get-field-ids:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch field IDs
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_PAT }}
+          script: |
+            const owner = "damianos-pappas";
+            const projectNumber = 1;
+
+            const data = await github.graphql(
+              `
+              query($login: String!, $number: Int!) {
+                user(login: $login) {
+                  projectV2(number: $number) {
+                    id
+                    title
+                    fields(first: 100) {
+                      nodes {
+                        __typename
+                        ... on ProjectV2FieldCommon {
+                          id
+                          name
+                          dataType
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              `,
+              { login: owner, number: projectNumber }
+            );
+
+            const project = data.user.projectV2;
+            const fields = project.fields.nodes;
+
+            const want = new Map([
+              ["CreatedAt", "DATE"],
+              ["UpdatedAt", "DATE"],
+              ["UpdatedProperty", "TEXT"],
+            ]);
+
+            const matches = [];
+
+            for (const f of fields) {
+              if (!f?.name || !f?.id) continue;
+              const expectedType = want.get(f.name);
+              if (!expectedType) continue;
+
+              // dataType is returned on ProjectV2FieldCommon
+              const actualType = f.dataType;
+              matches.push({
+                name: f.name,
+                id: f.id,
+                expectedType,
+                actualType,
+                ok: actualType === expectedType,
+              });
+            }
+
+            core.info(`Project title: ${project.title}`);
+            core.info(`Project node id (PROJECT_ID): ${project.id}`);
+
+            // Print in "secrets-ready" format
+            const byName = Object.fromEntries(matches.map(m => [m.name, m]));
+            function must(name) {
+              if (!byName[name]) throw new Error(`Field not found: ${name}`);
+              if (!byName[name].ok) {
+                throw new Error(`Field "${name}" has type ${byName[name].actualType}, expected ${byName[name].expectedType}`);
+              }
+              return byName[name].id;
+            }
+
+            const createdId = must("CreatedAt");
+            const updatedId = must("UpdatedAt");
+            const updatedPropId = must("UpdatedProperty");
+
+            console.log("");
+            console.log("=== COPY THESE INTO REPO SECRETS ===");
+            console.log(`PROJECT_ID=${project.id}`);
+            console.log(`FIELD_CREATEDAT_ID=${createdId}`);
+            console.log(`FIELD_UPDATEDAT_ID=${updatedId}`);
+            console.log(`FIELD_UPDATEDPROPERTY_ID=${updatedPropId}`);
+            console.log("===================================");
