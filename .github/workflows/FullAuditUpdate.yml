@@ -241,7 +241,7 @@ jobs:
                 await setDateField(item.id, fieldUpdatedAtId, today);
 
                 // Timestamp as ISO string (TEXT field)
-                await setTextField(item.id, fieldUpdatedAtTimestampId, new Date().toISOString());
+                await setTextField(item.id, fieldUpdatedAtTimestampId, new Date().toISOString().slice(0, 16).replace("T", " "));
 
                 touched++;
               }
