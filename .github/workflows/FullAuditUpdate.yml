@@ -1,0 +1,253 @@
+name: Project audit (resolve IDs + update CreatedAt/UpdatedAt/UpdatedAtTimestamp)
+
+on:
+  schedule:
+    - cron: "*/30 * * * *" # UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: project-audit
+  cancel-in-progress: false
+
+env:
+  PROJECT_OWNER: damianos-pappas
+  PROJECT_NUMBER: 1
+
+jobs:
+  resolve-project-id:
+    runs-on: ubuntu-latest
+    outputs:
+      project_id: ${{ steps.get_project_id.outputs.project-id }}
+    steps:
+      - name: Get Project ID
+        id: get_project_id
+        uses: monry/actions-get-project-id@v2
+        with:
+          github-token: ${{ secrets.PROJECT_PAT }}
+          project-owner: ${{ env.PROJECT_OWNER }}
+          project-number: ${{ env.PROJECT_NUMBER }}
+
+      - name: Show Project ID
+        run: |
+          echo "PROJECT_ID = ${{ steps.get_project_id.outputs.project-id }}"
+          echo "ERROR (if any) = ${{ steps.get_project_id.outputs.error }}"
+
+  resolve-field-ids:
+    runs-on: ubuntu-latest
+    needs: [resolve-project-id]
+    outputs:
+      field_createdat_id: ${{ steps.resolve.outputs.field_createdat_id }}
+      field_updatedat_id: ${{ steps.resolve.outputs.field_updatedat_id }}
+      field_updatedattimestamp_id: ${{ steps.resolve.outputs.field_updatedattimestamp_id }}
+    steps:
+      - name: Resolve audit field IDs
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_PAT }}
+          script: |
+            const owner = process.env.PROJECT_OWNER;
+            const projectNumber = Number(process.env.PROJECT_NUMBER);
+
+            const data = await github.graphql(
+              `
+              query($login: String!, $number: Int!) {
+                user(login: $login) {
+                  projectV2(number: $number) {
+                    id
+                    title
+                    fields(first: 100) {
+                      nodes {
+                        __typename
+                        ... on ProjectV2FieldCommon {
+                          id
+                          name
+                          dataType
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              `,
+              { login: owner, number: projectNumber }
+            );
+
+            const project = data.user.projectV2;
+            const fields = project.fields.nodes || [];
+
+            const want = new Map([
+              ["CreatedAt", "DATE"],
+              ["UpdatedAt", "DATE"],
+              ["UpdatedAtTimestamp", "TEXT"],
+            ]);
+
+            const byName = new Map();
+            for (const f of fields) {
+              if (!f?.name || !f?.id) continue;
+              if (want.has(f.name)) byName.set(f.name, f);
+            }
+
+            function must(name) {
+              const f = byName.get(name);
+              if (!f) throw new Error(`Field not found in project: "${name}"`);
+              const expected = want.get(name);
+              if (f.dataType !== expected) {
+                throw new Error(`Field "${name}" has type ${f.dataType}, expected ${expected}`);
+              }
+              return f.id;
+            }
+
+            core.info(`Project title: ${project.title}`);
+            core.info(`Project node id: ${project.id}`);
+
+            core.setOutput("field_createdat_id", must("CreatedAt"));
+            core.setOutput("field_updatedat_id", must("UpdatedAt"));
+            core.setOutput("field_updatedattimestamp_id", must("UpdatedAtTimestamp"));
+
+  audit:
+    runs-on: ubuntu-latest
+    needs: [resolve-project-id, resolve-field-ids]
+    steps:
+      - name: Update project fields
+        uses: actions/github-script@v7
+        env:
+          PROJECT_ID: ${{ needs.resolve-project-id.outputs.project_id }}
+          FIELD_CREATEDAT_ID: ${{ needs.resolve-field-ids.outputs.field_createdat_id }}
+          FIELD_UPDATEDAT_ID: ${{ needs.resolve-field-ids.outputs.field_updatedat_id }}
+          FIELD_UPDATEDATTIMESTAMP_ID: ${{ needs.resolve-field-ids.outputs.field_updatedattimestamp_id }}
+        with:
+          github-token: ${{ secrets.PROJECT_PAT }}
+          script: |
+            const projectId = process.env.PROJECT_ID;
+            const fieldCreatedAtId = process.env.FIELD_CREATEDAT_ID;
+            const fieldUpdatedAtId = process.env.FIELD_UPDATEDAT_ID;
+            const fieldUpdatedAtTimestampId = process.env.FIELD_UPDATEDATTIMESTAMP_ID;
+
+            if (!projectId || !fieldCreatedAtId || !fieldUpdatedAtId || !fieldUpdatedAtTimestampId) {
+              throw new Error("Missing PROJECT_ID or one of the FIELD_* env vars");
+            }
+
+            const utcToday = () => {
+              const d = new Date();
+              const yyyy = d.getUTCFullYear();
+              const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+              const dd = String(d.getUTCDate()).padStart(2, "0");
+              return `${yyyy}-${mm}-${dd}`; // DATE field format
+            };
+
+            const startOfTodayUtc = () => {
+              const now = new Date();
+              return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+            };
+
+            async function fetchItemsPage(after) {
+              return await github.graphql(
+                `
+                query($projectId: ID!, $after: String) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      items(first: 100, after: $after) {
+                        nodes {
+                          id
+                          createdAt
+                          updatedAt
+                          fieldValues(first: 100) {
+                            nodes {
+                              __typename
+                              ... on ProjectV2ItemFieldDateValue {
+                                date
+                                field { ... on ProjectV2FieldCommon { id name } }
+                              }
+                            }
+                          }
+                        }
+                        pageInfo { hasNextPage endCursor hasNextPage }
+                      }
+                    }
+                  }
+                }
+                `,
+                { projectId, after }
+              );
+            }
+
+            async function setDateField(itemId, fieldId, date) {
+              await github.graphql(
+                `
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $date: Date!) {
+                  updateProjectV2ItemFieldValue(input:{
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { date: $date }
+                  }) { projectV2Item { id } }
+                }
+                `,
+                { projectId, itemId, fieldId, date }
+              );
+            }
+
+            async function setTextField(itemId, fieldId, text) {
+              await github.graphql(
+                `
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+                  updateProjectV2ItemFieldValue(input:{
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { text: $text }
+                  }) { projectV2Item { id } }
+                }
+                `,
+                { projectId, itemId, fieldId, text: (text ?? "").toString().slice(0, 500) }
+              );
+            }
+
+            // Get current CreatedAt field value (if any) for each item so we don't overwrite it
+            function getCreatedAtFieldValue(item) {
+              const nodes = item.fieldValues?.nodes || [];
+              const n = nodes.find(x => x?.field?.id === fieldCreatedAtId);
+              return n?.date || "";
+            }
+
+            const today = utcToday();
+            const todayStart = startOfTodayUtc();
+
+            let after = null;
+            let scanned = 0;
+            let touched = 0;
+
+            while (true) {
+              const data = await fetchItemsPage(after);
+              const conn = data.node.items;
+              const items = conn.nodes || [];
+
+              for (const item of items) {
+                scanned++;
+
+                // Only touch items updated today (UTC)
+                const itemUpdatedAt = new Date(item.updatedAt);
+                if (itemUpdatedAt < todayStart) continue;
+
+                const createdVal = getCreatedAtFieldValue(item);
+                if (!createdVal) {
+                  await setDateField(item.id, fieldCreatedAtId, today);
+                }
+
+                await setDateField(item.id, fieldUpdatedAtId, today);
+
+                // Timestamp as ISO string (TEXT field)
+                await setTextField(item.id, fieldUpdatedAtTimestampId, new Date().toISOString());
+
+                touched++;
+              }
+
+              if (!conn.pageInfo.hasNextPage) break;
+              after = conn.pageInfo.endCursor;
+            }
+
+            core.info(`Scanned ${scanned} items. Updated ${touched} items (updated since ${today} UTC).`);
