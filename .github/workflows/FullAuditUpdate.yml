@@ -1,4 +1,4 @@
-name: Project audit (resolve IDs + update CreatedAt/UpdatedAt/UpdatedAtTimestamp)
+name: Project audit fields update
 
 on:
   schedule:
