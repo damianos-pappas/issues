@@ -11,7 +11,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  # IMPORTANT: This must be the ORG login (not a user)
   PROJECT_OWNER: your-enterprise-org
   PROJECT_NUMBER: 1
 
@@ -63,6 +62,7 @@ jobs:
       field_createdat_id: ${{ steps.resolve.outputs.field_createdat_id }}
       field_updatedat_id: ${{ steps.resolve.outputs.field_updatedat_id }}
       field_updatedattimestamp_id: ${{ steps.resolve.outputs.field_updatedattimestamp_id }}
+      field_closedat_id: ${{ steps.resolve.outputs.field_closedat_id }}
     steps:
       - name: Resolve audit field IDs (Org Project)
         id: resolve
@@ -104,6 +104,7 @@ jobs:
               ["CreatedAt", "DATE"],
               ["UpdatedAt", "DATE"],
               ["UpdatedAtTimestamp", "TEXT"],
+              ["ClosedAt", "DATE"],
             ]);
 
             const byName = new Map();
@@ -128,18 +129,20 @@ jobs:
             core.setOutput("field_createdat_id", must("CreatedAt"));
             core.setOutput("field_updatedat_id", must("UpdatedAt"));
             core.setOutput("field_updatedattimestamp_id", must("UpdatedAtTimestamp"));
+            core.setOutput("field_closedat_id", must("ClosedAt"));
 
   audit:
     runs-on: ubuntu-latest
     needs: [resolve-project-id, resolve-field-ids]
     steps:
-      - name: Update project fields
+      - name: Update project fields (including ClosedAt)
         uses: actions/github-script@v7
         env:
           PROJECT_ID: ${{ needs.resolve-project-id.outputs.project_id }}
           FIELD_CREATEDAT_ID: ${{ needs.resolve-field-ids.outputs.field_createdat_id }}
           FIELD_UPDATEDAT_ID: ${{ needs.resolve-field-ids.outputs.field_updatedat_id }}
           FIELD_UPDATEDATTIMESTAMP_ID: ${{ needs.resolve-field-ids.outputs.field_updatedattimestamp_id }}
+          FIELD_CLOSEDAT_ID: ${{ needs.resolve-field-ids.outputs.field_closedat_id }}
         with:
           github-token: ${{ secrets.PROJECT_PAT }}
           script: |
@@ -147,8 +150,9 @@ jobs:
             const fieldCreatedAtId = process.env.FIELD_CREATEDAT_ID;
             const fieldUpdatedAtId = process.env.FIELD_UPDATEDAT_ID;
             const fieldUpdatedAtTimestampId = process.env.FIELD_UPDATEDATTIMESTAMP_ID;
+            const fieldClosedAtId = process.env.FIELD_CLOSEDAT_ID;
 
-            if (!projectId || !fieldCreatedAtId || !fieldUpdatedAtId || !fieldUpdatedAtTimestampId) {
+            if (!projectId || !fieldCreatedAtId || !fieldUpdatedAtId || !fieldUpdatedAtTimestampId || !fieldClosedAtId) {
               throw new Error("Missing PROJECT_ID or one of the FIELD_* env vars");
             }
 
@@ -165,6 +169,16 @@ jobs:
               return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
             };
 
+            const toUtcDateOnly = (isoString) => {
+              if (!isoString) return "";
+              const d = new Date(isoString);
+              if (Number.isNaN(d.getTime())) return "";
+              const yyyy = d.getUTCFullYear();
+              const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+              const dd = String(d.getUTCDate()).padStart(2, "0");
+              return `${yyyy}-${mm}-${dd}`;
+            };
+
             async function fetchItemsPage(after) {
               return await github.graphql(
                 `
@@ -176,11 +190,29 @@ jobs:
                           id
                           createdAt
                           updatedAt
+                          content {
+                            __typename
+                            ... on Issue {
+                              id
+                              state
+                              closedAt
+                            }
+                            ... on PullRequest {
+                              id
+                              state
+                              closedAt
+                              mergedAt
+                            }
+                          }
                           fieldValues(first: 100) {
                             nodes {
                               __typename
                               ... on ProjectV2ItemFieldDateValue {
                                 date
+                                field { ... on ProjectV2FieldCommon { id name } }
+                              }
+                              ... on ProjectV2ItemFieldTextValue {
+                                text
                                 field { ... on ProjectV2FieldCommon { id name } }
                               }
                             }
@@ -228,11 +260,30 @@ jobs:
               );
             }
 
-            // Get current CreatedAt field value (if any) for each item so we don't overwrite it
-            function getCreatedAtFieldValue(item) {
+            function getDateFieldValue(item, fieldId) {
               const nodes = item.fieldValues?.nodes || [];
-              const n = nodes.find(x => x?.field?.id === fieldCreatedAtId);
+              const n = nodes.find(x => x?.field?.id === fieldId);
               return n?.date || "";
+            }
+
+            function computeClosedDate(item) {
+              const c = item.content;
+              if (!c || !c.__typename) return "";
+
+              if (c.__typename === "Issue") {
+                // state: OPEN/CLOSED
+                if (c.state !== "CLOSED") return "";
+                return toUtcDateOnly(c.closedAt);
+              }
+
+              if (c.__typename === "PullRequest") {
+                // state: OPEN/CLOSED/MERGED (MERGED still usually has closedAt)
+                if (c.state !== "CLOSED" && c.state !== "MERGED") return "";
+                // prefer mergedAt when present, otherwise closedAt
+                return toUtcDateOnly(c.mergedAt || c.closedAt);
+              }
+
+              return "";
             }
 
             const today = utcToday();
@@ -241,6 +292,7 @@ jobs:
             let after = null;
             let scanned = 0;
             let touched = 0;
+            let closedSet = 0;
 
             while (true) {
               const data = await fetchItemsPage(after);
@@ -250,23 +302,36 @@ jobs:
               for (const item of items) {
                 scanned++;
 
-                // Only touch items updated today (UTC)
+                // Only touch items updated today (UTC).
+                // Closing an issue/PR updates it, so this also catches "closed today" items.
                 const itemUpdatedAt = new Date(item.updatedAt);
                 if (itemUpdatedAt < todayStart) continue;
 
-                const createdVal = getCreatedAtFieldValue(item);
+                // CreatedAt: set once (if blank)
+                const createdVal = getDateFieldValue(item, fieldCreatedAtId);
                 if (!createdVal) {
                   await setDateField(item.id, fieldCreatedAtId, today);
                 }
 
+                // UpdatedAt: set every time we touch it
                 await setDateField(item.id, fieldUpdatedAtId, today);
 
-                // Timestamp as ISO-ish string (TEXT field)
+                // UpdatedAtTimestamp: set every time we touch it
                 await setTextField(
                   item.id,
                   fieldUpdatedAtTimestampId,
                   new Date().toISOString().slice(0, 16).replace("T", " ")
                 );
+
+                // ClosedAt: set only when the linked content is closed/merged and field is currently blank
+                const existingClosed = getDateFieldValue(item, fieldClosedAtId);
+                if (!existingClosed) {
+                  const closedDate = computeClosedDate(item);
+                  if (closedDate) {
+                    await setDateField(item.id, fieldClosedAtId, closedDate);
+                    closedSet++;
+                  }
+                }
 
                 touched++;
               }
@@ -275,4 +340,4 @@ jobs:
               after = conn.pageInfo.endCursor;
             }
 
-            core.info(`Scanned ${scanned} items. Updated ${touched} items (updated since ${today} UTC).`);
+            core.info(`Scanned ${scanned} items. Touched ${touched} items (updated since ${today} UTC). Set ClosedAt on ${closedSet} items.`);
